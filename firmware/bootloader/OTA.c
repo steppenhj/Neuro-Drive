@@ -34,10 +34,16 @@
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
 #define APP_ADDRESS 0x08004000 //Application 시작 주소 (Sector 1) 이게 진짜 중요함
-#define CHUNK_SIZE 256 //한번에 수신하는 바이트
+#define CHUNK_SIZE 256 //한번에 수신하는 바이트. 
+// 7/27 SRAM 128KB 중 부트로더가 쓸 수 있는 스택은 작다. RAM 사용량의 상한
+
 #define UPDATE_TIMEOUT_MS 3000 //"UPDATE" 대기 시간 (3초)
+// 별도 부팅 핀 없이 UART만으로 모드를 가르는 대가. 
+
 #define ACK_TIMEOUT_MS 5000  // 청크 수신 타임아웃 (5초)
 #define MAX_APP_SIZE ((512-16) * 1024)  //최대 App 크기 (496KB)
+// 512KB=전체 Flash, 16KB=Sector 0(부트로더). 즉 앱이 쓸 수 있는 Sector 1~7의 합
+
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -109,8 +115,8 @@ int main(void)
   HAL_GPIO_WritePin(LD2_GPIO_Port, LD2_Pin, GPIO_PIN_SET);
 
   // Step1: 업데이트 신호 대기 (3초)
-  if(!WaitForUpdateSignal(UPDATE_TIMEOUT_MS)){
-	  //신호 없음 -> 정상 부팅
+  if(!WaitForUpdateSignal(UPDATE_TIMEOUT_MS)){ // 이 분기가 부트로더의 유일한 갈림길. 
+	  //신호 없음 -> 정상 부팅, 신호 있음 -> 업데이트 모드
 	  HAL_GPIO_WritePin(LD2_GPIO_Port, LD2_Pin, GPIO_PIN_RESET);
 	  JumpToApp();
 
@@ -150,7 +156,8 @@ int main(void)
 
   //Step5: 바이너리 수신 & Flash Write
   uint32_t received = 0;
-  uint8_t chunk[CHUNK_SIZE];
+  uint8_t chunk[CHUNK_SIZE]; //부트로더가 쓰는 사실상 유일한 RAM 버퍼. 
+  // 496KB 펌웨어를 128KB SRAM으로 처리하는 방법
 
   while(received < total_size){
 	  uint32_t to_read = total_size - received;
@@ -189,6 +196,7 @@ int main(void)
   }
 
   uint32_t actual_crc = CalculateFlashCRC(APP_ADDRESS, total_size);
+  // RAM이 아니라 Flash를 다시 읽어 계산한다. 전송 오류뿐 아니라 저장 오류까지 검증.
 
   if(actual_crc != expected_crc){
 	  SendString("NACK\r\n");
@@ -335,18 +343,23 @@ typedef void (*pFunction)(void);
 void JumpToApp(void)
 {
 	//(1) App 영역의 첫 4바이트 = Initial Stack Pointer
+  // 앱 Flash의 첫 4바이트가 왜 코드가 아니라 SP인가? 
+  // -> 리셋 시 하드웨어가 하는 일을 소프트웨어로 재현
 	uint32_t app_sp = *(volatile uint32_t*)APP_ADDRESS;
 
 	//(2) 그 다음 4바이트 = Reset Handler 주소
+  // 다음 4바이트 = Reset Handler 주소. 이 8바이트가 벡터 테이블의 앞머리
 	uint32_t app_entry = *(volatile uint32_t*)(APP_ADDRESS + 4);
 
 	//(3) SP가 유효한 SRAM 범위인지 검증
 	// STM32F411RE의 SRAM: 0X2000_0000 ~ 0X2002_0000 (128KB)
+  // F411RE의 SRAM 128KB 범위. 앱이 없으면 지워진 Flash라 0xFFFFFFFF가 읽히고 이 범위 밖 -> 점프 안 함
 	if((app_sp < 0x20000000) || (app_sp > 0x20020000)) {
 		return; //App 이 없거나 손상됨 -> 부트로더에 머무름
 	}
 
 	//(4) 모든 인터럽트 비활성화
+  // 빼면? -> 점프 도중 인터럽트가 뜨면 아직 부트로더 벡터 테이블을 보는 상태에서 SP만 바뀐 어중간한 문맥으로 진입
 	__disable_irq();
 
 	//(5) SysTick 정지 (HAL이 사용하던 타이머)
@@ -355,6 +368,7 @@ void JumpToApp(void)
 	SysTick->VAL = 0;
 
 	//(6) Vector Table을 App 주소로 재설정
+  // 가장 중요. 빼면? -> 앱은 도는데 인터럽트만 부트로더 핸들러로 가는, 원인 찾기 극도록 어려운 버그
 	SCB->VTOR = APP_ADDRESS;
 
 	//(7) Stack Pointer 설정
@@ -397,38 +411,43 @@ HAL_StatusTypeDef EraseAppFlash(void)
 	FLASH_EraseInitTypeDef erase;
 	uint32_t sector_error;
 
-	erase.TypeErase = FLASH_TYPEERASE_SECTORS;
-	erase.VoltageRange = FLASH_VOLTAGE_RANGE_3; //2.7~3.6V
+	erase.TypeErase = FLASH_TYPEERASE_SECTORS; 
+  // "바이트 지우기"가 없는 이유 -> Flash 셀은 0->1 복원에 고전압이 필요해 섹터 통째로만 가능하다는 물리적 제약.
+	erase.VoltageRange = FLASH_VOLTAGE_RANGE_3; //2.7~3.6V. 
 	erase.Sector = FLASH_SECTOR_1; // Sector 0 은 절대 건드리지 않음 (부트로더) (1~7까지 지우기)
-	erase.NbSectors = 7;
+  // 부트로더가 자기 자신을 지우지 않는 것이 이 시스템이 절대 벽돌이 되지 않는 이유.
+	erase.NbSectors = 7; // 1부터 7까지=496KB. MAX_APP_SIZE와 같은 값
 
 	return HAL_FLASHEx_Erase(&erase, &sector_error);
 }
 
 // 5. 수신한 데이터를 Flash에 기록
+// 7/27 이 함수 호출 전에 반드시 erase가 끝나 있어야 한다.
+// Flash는 1->0만 가능하므로 0xFF 상태가 아닌 곳에 쓰면 원하는 값이 안 나온다.
 HAL_StatusTypeDef WriteChunkToFlash(uint32_t address, uint8_t* data, uint32_t len)
 {
+  // 왜 4씩 건너뛰나 -> FLASH_TYPEPROGRAM_WORD가 32비트 단위. 256바이트면 64회 호출.
 	for(uint32_t i=0; i<len; i+=4){
 		uint32_t word = *(uint32_t*)&data[i];
 		if(HAL_FLASH_Program(FLASH_TYPEPROGRAM_WORD, address+i, word) != HAL_OK){
-			return HAL_ERROR;
+			return HAL_ERROR; // Flash 쓰기는 실패할 수 있는 연산이다. SRAM과 차이.
 		}
 	}
 	return HAL_OK;
 }
 
 // 6. CRC32 계산 (소프트웨어 구현)
-// 원본 데이어와 동일한지 검증. python에 zlib.crc32()로 계산한 값과 비교할 예정
-// CRC32는 구글링하면 됨
+// 원본 데이터와 동일한지 검증. python에 zlib.crc32()로 계산한 값과 비교할 예정
+// CRC32는 구글링하는 게 좋다
 uint32_t CalculateFlashCRC(uint32_t start_addr, uint32_t size)
 {
-	uint32_t crc = 0xFFFFFFFF;
+	uint32_t crc = 0xFFFFFFFF; // 초기값. -> 앞에 0이 몇 개 부어도 값이 달라지도록 만드는 장치
 	uint8_t* ptr = (uint8_t*)start_addr;
 
 	for(uint32_t i=0; i<size; i++){
 		crc ^= ptr[i];
 		for(int j=0; j<8; j++){
-			crc = (crc >> 1) ^ (0xEDB88320 & -(crc & 1));
+			crc = (crc >> 1) ^ (0xEDB88320 & -(crc & 1)); // 0xEDB88320은 CRC-32 표준 다항식을 비트 반사한 값(그래서 오른쪽 시프트)
 		}
 	}
 	return crc ^ 0xFFFFFFFF;
