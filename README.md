@@ -6,248 +6,212 @@
 ![STM32](https://img.shields.io/badge/MCU-STM32F411RE-03234B?logo=stmicroelectronics&logoColor=white)
 ![Raspberry Pi](https://img.shields.io/badge/MPU-Raspberry_Pi_5-C51A4A?logo=raspberrypi&logoColor=white)
 
-물리적으로 분리된 두 프로세서에 **소프트 실시간(Linux)** 과 **하드 실시간(RTOS)** 역할을 나누고, 서로를 완전히 신뢰할 수 없는 상황에서 협력하게 만드는 방법을 보여주는 자율주행 RC카 플랫폼.
-
-Ackermann 조향 UGV를 위한 이기종 MPU/MCU 아키텍처에서의 **실시간 제어, 통신 파이프라인 설계, Fail-Safe 메커니즘**에 초점을 맞춥니다.
-
----
-
-### 시연 영상 — Phase 4: Return-to-Home
-
-https://github.com/user-attachments/assets/2779ef3e-39d6-4a21-8bef-ed63d195250f
-
----
-
-## 프로젝트 발전 과정
-
-이 프로젝트는 6단계에 걸쳐 발전했으며, 각 단계는 이전 단계에서 드러난 문제를 해결하는 방식으로 진행되었습니다.  
-Phase 2와 3 사이의 **전환점** — 필드 테스트 중 발생한 하드웨어 장애 — 은 전체 아키텍처를 재설계하는 계기가 되었습니다.  
-각 Phase를 클릭하면 상세 내용을 확인할 수 있습니다.
-
-| Phase | 주제 | 해결한 핵심 문제 | 상태 |
-|:-----:|------|--------------------|:----:|
-| **1** | [단일 Linux 제어](https://steppenhj.github.io/#phase1) | 단일 RPi 보드에서 Python ↔ C++ IPC 구현 | ✅ 완료 |
-| **2** | [STM32 분산 아키텍처](https://steppenhj.github.io/#phase2) | Linux의 Hard Real-Time 불가 → Brain(RPi) / Reflex(MCU)로 분리 | ✅ 완료 |
-| ⚠️ | [**전환점 — 운용 중 장애 발생**](https://steppenhj.github.io/#turning_point) | 필드 테스트 중 7.4V 배터리 선이 RPi 3.3V GPIO에 접촉 → 전체 아키텍처 전면 재설계 | — |
-| **3** | [RTOS 및 Interrupt 기반 제어](https://steppenhj.github.io/#phase3) | Bare-metal Polling의 100Hz 데드라인 미달 → FreeRTOS + ISR + Queue, P 제어 + Feedforward | ✅ 완료 |
-| **4** | [Return-to-Home 안전 시스템](https://steppenhj.github.io/#phase4) | Watchdog과 자율 동작의 충돌 → Keep-Alive 패턴, 8B → 12B 프로토콜 확장 | ✅ 완료 |
-| **5** | [OTA Firmware 업데이트](https://steppenhj.github.io/#phase5) | 물리적 재플래싱 부담 → 커스텀 Bootloader, CRC 핸드셰이크, 섹터 관리 | ✅ 완료 |
-| **6** | [CAN Bus 및 Multi-ECU](https://steppenhj.github.io/#phase6) | 단일 UART 병목 → 3노드 CAN 2.0 분산 제어 | 🔀 [multi-mcu-can](https://github.com/steppenhj/multi-mcu-can)으로 이전 |
-| ⚠️ | **장애 — 조향 서보 소손** | 코드 수정 중 모터/서보 출력 매핑이 뒤바뀜 → 서보에 스로틀 값 인가, 스톨 소손 → 실차 검증 중단, CAN 작업은 벤치 환경으로 이전 | — |
-
-> ⚠️ **장애 분석 — 조향 서보 소손** (발생 2026-05 · 원인 확정 2026-07)
->
-> F446RE 이식 자체는 성공하여 주행까지 확인했으나, 조종 반응 지연(큐 명령 적체)을 수정하는 과정에서 **모터와 서보의 출력 타이머 매핑이 서로 뒤바뀌었습니다.** 배선은 그대로였기 때문에 조향 서보가 스로틀 값을 위치 명령으로 받았고, 기계적 한계로 몰린 상태에서 스톨 전류가 지속되어 소손되었습니다. 같은 편집에서 비상정지 로직도 함께 뒤집혀, 안전장치가 오히려 작동할 수 없는 상태였습니다(공통원인고장).
->
-> 당시에는 원인을 특정하지 못한 채 하드웨어 문제로 남겨두었고, **약 3개월 뒤 커밋 이력을 역추적하여 원인을 확정**했습니다. 정상 주행 → 매핑 스왑 → 소손으로 이어지는 변경 사슬이 diff에 그대로 남아 있었습니다.
->
-> **도출한 원칙**
-> - 핀 ↔ 장치 바인딩은 한 곳에서만 정의하고, 본문에서 타이머 핸들을 직접 사용하지 않습니다
-> - 출력 경로를 변경한 커밋은 액추에이터를 분리한 상태에서 파형부터 검증합니다
-> - 한 커밋에 성격이 다른 변경(로직 수정 + 매핑 정리)을 섞지 않습니다
-> - 자동 생성 코드·설정 파일도 형상관리에 포함합니다 (`tim.c` 미포함으로 사후 분석이 제한되었습니다)
-
----
-
-## 아키텍처
-
-![System Architecture](assets/omd_diagram.png)
-
-**MPU (Raspberry Pi 5 / Linux)** — Web UI, WebSocket 서버, UDP 릴레이, 상위 레벨 모드 관리 (RTH, Keep-Alive).  
-**MCU (STM32F411RE / FreeRTOS)** — UART ISR, RTOS 태스크 스케줄링, PWM 생성, 엔코더 읽기, 명령 타임아웃 감시(소프트웨어 워치독 태스크).
-
-### 데이터 흐름
-
-```
-Browser ──WebSocket──▶ Python (Flask-SocketIO)
-                          │
-                          ├──UDP (12B: throttle, steering, mode)──▶ C++ Control Core
-                          │                                              │
-                          │                                         UART (115200)
-                          │                                              │
-                          │                                              ▼
-                          │                                      STM32 (FreeRTOS)
-                          │                                        ├─ UART RX ISR → Queue
-                          │                                        ├─ Motor Task (PWM)
-                          │                                        ├─ Encoder Task (TIM1)
-                          │                                        └─ Safety Task (Watchdog)
-                          │
-                          └──UDP (Encoder telemetry)◀── C++ ◀──UART── STM32
-```
-
----
-
-## MBSE 설계 다이어그램
-
-IBM Rhapsody, StarUML을 사용해 요구사항 정의부터 구현까지 일관된 모델로 문서화했습니다.
-
-<details>
-<summary><kbd>&nbsp; ▶ 클릭하여 펼치기 &nbsp;</kbd> &nbsp; <b>📐 MBSE 다이어그램 4종</b> — 유스케이스 · 클래스 · 시퀀스 · 상태차트</summary>
-
-<br>
-
-### 유스케이스 다이어그램
-
-![Use Case Diagram](assets/usecase_diagram.png)
-
-Operator가 시스템과 상호작용하는 주요 유스케이스를 정의합니다. `Control Vehicle Movement`는 Cornering Boost 적용, Output Power 제한, Return-to-Home을 `<<include>>`하며, 하드웨어 환경(Hardware_Environment)이 Fail-Safe 실행에 참여합니다.
-
-### 클래스 다이어그램 (C++ Control Core)
-
-![Class Diagram](assets/architecture_diagram.png)
-
-RPi 측 Control Core의 C++ 클래스 구조입니다. `SharedContext`가 `std::mutex`와 `std::atomic`으로 보호되는 공유 상태를 소유하며, `UdpReceiver`와 `VehicleController`가 이를 참조합니다.
-
-### 시퀀스 다이어그램 (제어 명령 흐름)
-
-![Sequence Diagram](assets/sequence_diagram.png)
-
-조이스틱 입력이 Web UI → Python Middleware → C++ Core → STM32까지 전달되는 전 계층 데이터 흐름을 보여줍니다. WebSocket JSON → UDP Binary Packet → UART String 순으로 프로토콜이 변환됩니다.
-
-### 상태차트 다이어그램 (RTH & Fail-Safe FSM)
-
-![State Chart Diagram](assets/statechart_diagram.png)
-
-시스템의 동작 상태를 정의합니다. `OPERATING` 상태에서 RTH 명령 수신 시 `RTH_RECORDING` → `RTH_ACTIVE`로 전이하며, Watchdog 타임아웃(`timeout == true`) 발생 시 `FAIL_SAFE`로 전이합니다.
-
-</details>
-
----
-
-## Phase 6 — CAN Bus 다이어그램
-
-> 3노드 아키텍처와 배선 등 초기 설계는 이 저장소에서 수행했으며, CAN 통신 구현은 **[multi-mcu-can](https://github.com/steppenhj/multi-mcu-can)** 에서 완료되었습니다.
-
-<details>
-<summary><kbd>&nbsp; ▶ 클릭하여 펼치기 &nbsp;</kbd> &nbsp; <b>🔌 Phase 6 CAN 다이어그램</b> — 블록 · 시퀀스 · 배선도</summary>
-
-<br>
-
-### 블록 다이어그램 (3노드 CAN 아키텍처)
-
-![Phase 6 Block Diagram](assets/phase6_block_diagram.png)
-
-RPi5(Gateway), STM32F446RE(MotorECU), STM32F411RE(SensorECU) 3노드가 MCP2515(SPI→CAN) + TJA1050(트랜시버)를 통해 CAN 2.0 버스로 연결됩니다. 단일 UART 병목을 해소하고 노드별 책임을 분리합니다.
-
-### 시퀀스 다이어그램 (CAN 메시지 흐름 & 장애물 대응)
-
-![Phase 6 Sequence Diagram](assets/phase6_sequence_diagram.png)
-
-`0x100 MotorCMD`(50ms), `0x200 MotorStatus`(100ms), `0x300 SensorData`(100ms, broadcast) 세 CAN ID로 노드 간 통신을 구성하도록 설계했습니다. SensorECU가 거리 20cm 미만을 감지하면 MotorECU가 자율적으로 PWM을 0으로 설정(자동 정지)하고, 상태를 Gateway를 거쳐 WebUI까지 전파합니다.
-
-### 배선 다이어그램 (F446RE MotorECU — CAN 인터페이스)
-
-![F446RE CAN Wiring](tools/CAN_F446RE.png)
-
-STM32F446RE MotorECU CAN 인터페이스 핀 배선: bxCAN TX/RX → MCP2551 트랜시버 → 120Ω 종단 저항이 포함된 CAN 버스.
-위 배선도는 직접 제작한 웹 기반 배선도 편집기로 그렸으며, 소스는 [`tools/CAN_F446RE.json`](tools/CAN_F446RE.json)입니다.
-
-</details>
+라즈베리파이 5(Linux)와 STM32(FreeRTOS)가 역할을 나눠 움직이는 Ackermann 조향 RC카입니다.
+RPi 는 웹 조종 · 모드 관리 · 경로 기록을 맡고, STM32 는 모터 · 엔코더 · 안전 정지를 맡습니다.
+명령이 끊기면 두 쪽이 각자 차를 세우고, STM32 펌웨어는 직접 만든 UART 부트로더로 교체합니다.
 
 ---
 
 ## 시연 영상
 
-### Phase 5 — OTA Firmware 업데이트
+**Phase 4 — Return-to-Home**
+
+https://github.com/user-attachments/assets/2779ef3e-39d6-4a21-8bef-ed63d195250f
+
+**Phase 5 — OTA 펌웨어 업데이트**
 
 https://github.com/user-attachments/assets/81a38263-ff0c-47a8-944d-1e0a582e165a
 
 ---
 
-## 주요 기능
+## 구조
 
-**실패로부터 검증된 아키텍처** — 현재 설계는 Phase 2 필드 테스트 중 발생한 치명적 하드웨어 장애의 산물입니다. 탈락한 7.4V 배터리 선이 RPi의 3.3V GPIO에 접촉하는 사고 이후, 결정론적 C++ 제어 루프, RTOS 기반 Fail-Safe 로직, 물리적 절연이 도입되었습니다.
+![System Architecture](assets/omd_diagram.png)
 
-**분산 제어** — RPi는 네트워킹과 모드 로직을, STM32는 Hard Real-Time 모터 제어를 담당합니다. 두 프로세서는 서로의 역할을 대체할 수 없습니다.
+| 층 | 보드 | 하는 일 |
+|---|---|---|
+| 미션 (soft real-time) | Raspberry Pi 5 · Linux | 웹 UI · WebSocket 서버 · C++ 제어 코어(100Hz) · RTH 경로 기록·재생 · 명령 감시 |
+| 반사 (hard real-time) | STM32 NUCLEO-F411RE · FreeRTOS | UART 수신(ISR + Queue) · 모터 PWM · 엔코더 · 안전 태스크 |
 
-**FreeRTOS 태스크 아키텍처** — UART 수신(ISR + Queue), 모터 제어, 엔코더 읽기, 안전 모니터링이 독립적인 RTOS 태스크로 실행되며, 태스크 간 명령 전달은 메시지 큐(osMessageQueue)로 처리합니다.
+Linux 는 스케줄링이 결정적이지 않아 모터 제어를 맡기기 어렵습니다. 그래서 판단은 RPi, 구동은 STM32 로 나눴습니다.
 
-Feedback + Feedforward 하이브리드 제어 — STM32는 100Hz P-controller로 속도 오차를 보정(Feedback)하고, Python은 조향 각도에 비례한 코너링 부스트를 선적용(Feedforward)합니다. 조향은 open-loop 서보 제어입니다.
-
-**Watchdog & Fail-Safe** — RPi(C++ 제어 루프)와 MCU(FreeRTOS Task_Safety)가 각각 500ms 명령 타임아웃을 독립 감시하는 2중 소프트웨어 워치독. 링크 두절 시 MCU가 RPi와 무관하게 모터 PWM 출력을 차단합니다 (Task_Safety 감시 주기 50ms → 최악 반응 지연 약 550ms).
-
-**Return-to-Home (RTH)** — 엔코더 기반 경로 기록(LIFO 스택)과 자율 역주행. Watchdog 안전 기능과 자율 동작 간의 충돌을 Keep-Alive 패턴으로 해결하고, 전체 스택에 모드를 전파합니다. 복귀는 조작자 감독 하에서만 지속되며(dead-man switch), 복귀 중 링크 두절 시 즉시 FAIL_SAFE 정지합니다.
-
-**OTA Firmware 업데이트** — 핸드셰이크 프로토콜, CRC 검증 이미지 전송, 섹터 단위 Flash 관리, 올바른 Bootloader→Application 점프 시퀀스를 갖춘 커스텀 UART Bootloader.
-
-**MBSE 문서화** — IBM Rhapsody를 사용해 유스케이스, 객체 모델, 시퀀스, 상태차트 다이어그램으로 시스템 동작을 공식 문서화.
-
----
-
-## 기술 스택
-
-| 레이어 | 기술 |
-|--------|------|
-| Web UI | HTML/CSS/JS, nipplejs (joystick), Socket.IO |
-| 서버 | Python 3.11, Flask-SocketIO, eventlet |
-| Control Core | C++17, UDP socket, threads, mutex |
-| Firmware | C (STM32 HAL), FreeRTOS, UART ISR, TIM/PWM, 커스텀 Bootloader |
-| 통신 | WebSocket, UDP (struct pack), UART (115200 baud) |
-| 설계 도구 | IBM Rhapsody \| StarUML (MBSE), STM32CubeIDE |
-| 하드웨어 | Raspberry Pi 5, STM32 Nucleo-F411RE, L298N, Ackermann 섀시 |
+```
+Browser ──WebSocket(JSON)──▶ Python (Flask-SocketIO)
+                                 │
+                                 ├──UDP 12B (throttle, steering, mode)──▶ C++ Control Core
+                                 │                                            │
+                                 │                                       UART 115200
+                                 │                                            ▼
+                                 │                                    STM32 (FreeRTOS)
+                                 │                                     ├─ UART RX ISR → Queue
+                                 │                                     ├─ Motor Task (PWM)
+                                 │                                     ├─ Encoder Task (TIM1)
+                                 │                                     └─ Safety Task
+                                 │
+                                 └──UDP (엔코더 텔레메트리) ◀── C++ ◀──UART── STM32
+```
 
 ---
 
-## 하드웨어
+## 진행
 
-전체 부품 목록은 [docs/hardware.md](docs/hardware.md)에서 확인할 수 있습니다.
+| Phase | 내용 |
+|:-:|---|
+| 1 | RPi 하나로 제어 — Python 웹 서버와 C++ 제어 프로세스 |
+| 2 | STM32 를 붙여 판단(RPi)과 구동(STM32)을 분리 |
+| ⚠️ | 실내 주행 중 충돌로 빠진 7.4V 배터리 선이 RPi 3.3V GPIO 에 닿아 GPIO 일부를 잃음 → 물리적 절연 · RTOS 페일세이프 · 결정적 C++ 제어 루프로 재설계 |
+| 3 | FreeRTOS + ISR + Queue — 블로킹 UART 수신이 100Hz 제어 주기를 잡아먹던 구조를 바꿈 · P 제어 + 조향 비례 피드포워드 |
+| 4 | Return-to-Home — 워치독과 자율 복귀의 충돌을 Keep-Alive 로 해결 · 명령 패킷 8B → 12B(mode 추가) |
+| 5 | OTA — 직접 만든 UART 부트로더 · CRC 검증 · 섹터 관리 · 2026-09 유효 표식 추가 |
+| 6 | CAN 2.0 — 별도 저장소 [multi-mcu-can](https://github.com/steppenhj/multi-mcu-can) 에서 2노드로 구현 |
 
-| 구성 | 부품 |
-|------|------|
+---
+
+## 안전 정지
+
+- **두 층 워치독** — 브라우저는 100ms 마다 명령을 보냅니다. C++ 제어 코어는 500ms 동안 명령이 없으면 정지 명령을 보내고, STM32 의 안전 태스크도 같은 500ms 를 50ms 주기로 확인해 RPi 쪽이 통째로 죽어도 차를 세웁니다(최악 약 550ms).
+- **정지(fail-stop)를 기본으로** — 통신이 끊기면 스스로 돌아오지 않고 멈춥니다. 지상 차량은 멈춘 상태가 안전 상태이고, 엔코더 추측 항법은 오차가 쌓여 감독 없는 복귀를 믿기 어렵습니다.
+- **Return-to-Home 의 감시 범위** — 복귀는 조작자가 버튼으로 시작합니다(기록 → 복귀 → 해제). 복귀 중에는 RPi 안의 서버가 100ms 마다 keep-alive 를 보내므로, 서버 프로세스가 죽으면 멈추지만 **브라우저(Wi-Fi) 단절은 잡지 못합니다.** 복귀 중에도 브라우저 쪽을 감시하는 것이 남은 과제입니다.
+- **경로를 RPi 에 둔 이유** — 경로는 엔코더 변화량과 조향각 한 쌍(8바이트)을 주행 중 100Hz 로 쌓아 계속 자랍니다. MCU SRAM(128KB)에 두면 수십 초~수 분이면 넘치므로 메모리가 큰 RPi 에 두고 역순으로 재생합니다.
+
+---
+
+## OTA 부트로더 (Phase 5)
+
+| 영역 | 주소 | 크기 |
+|---|---|---|
+| 부트로더 | Sector 0 · `0x08000000` | 16KB |
+| 앱 | Sector 1~7 · `0x08004000` | 최대 496KB − 256B |
+| 유효 표식 | Sector 7 마지막 16바이트 · `0x0807FFF0` | magic · size · crc · ~magic |
+
+1. 리셋 후 3초 동안 UART 로 `UPDATE` 를 기다리고, 안 오면 앱 검사로 넘어갑니다.
+2. 업데이트 — 크기 수신 → Sector 1~7 지우기 → 256B 청크마다 ACK(stop-and-wait) → 다 쓴 뒤 **Flash 에서 다시 읽어** CRC32 비교.
+3. CRC 가 맞을 때만 유효 표식을 씁니다. magic 을 마지막에 써서, 표식을 쓰다 끊겨도 무효로 남습니다.
+4. 부팅 때 표식과 Flash CRC 를 다시 확인한 뒤에만 앱으로 넘어갑니다. 아니면 `NO_APP` 을 보내고 업데이트를 기다립니다.
+
+부트로더를 앱과 나눈 이유는 실행 중인 섹터를 스스로 지울 수 없고, 앱이 어떻게 깨져도 다시 올릴 수 있어야 하기 때문입니다.
+
+**보드 시험 (2026-09-28 · NUCLEO-F411RE)**
+
+| 시험 | 결과 |
+|---|---|
+| 정상 전송 | `DONE` → 재부팅 → 앱 실행 |
+| CRC 를 틀리게 전송 | `NACK` → 앱으로 넘어가지 않고 부트로더에서 대기 |
+| 전송 도중 중단 | 반쯤 쓰인 이미지로 넘어가지 않음 → 다시 보내 복구 |
+
+**한계** — 슬롯이 하나라 롤백이 없습니다. CRC 는 무결성만 확인하고 서명 검증은 없습니다. 청크 재전송이 없어 실패하면 처음부터 다시 보내고, 평소 부팅도 3초 대기를 거칩니다.
+
+---
+
+## 장애 분석 — 조향 서보 소손 (2026-05 · 원인 특정 2026-07)
+
+F446RE 이식은 주행까지 확인했습니다. 이틀 뒤 조종 반응 지연(큐에 쌓인 명령)을 고치던 커밋에서 **모터와 서보의 출력 타이머 매핑이 뒤바뀌었습니다.** 배선은 그대로라 서보가 스로틀 값을 위치 명령(0~999µs · 유효 범위 650~2350µs 밖)으로 받아 스톨했고, 여러 번 꺾여 속가닥이 끊어져 있던 GND 점퍼선이 그 전류를 견디지 못해 탔습니다. 같은 편집에서 비상정지도 새 매핑을 따라 뒤집혀 모터 드라이버를 끄지 못했습니다(공통원인고장). 망가진 것은 서보이고, L298N 은 이후 벤치 시험에서 정상으로 확인했습니다.
+
+당시에는 하드웨어 문제로 남겨두었고, 약 3개월 뒤 커밋 이력을 대조해 원인을 특정했습니다. `firmware/F446RE` 코드는 사고 당시 상태 그대로 두었습니다 — 주석의 타이머 매핑이 서로 다르게 적혀 있는 것은 그 흔적입니다.
+
+**재발 방지 원칙**
+- 핀 ↔ 장치 매핑은 한 곳에서만 정의합니다
+- 출력 경로를 바꾼 커밋은 액추에이터를 떼고 파형부터 확인합니다
+- 한 커밋에 성격이 다른 변경을 섞지 않습니다
+- 자동 생성 파일(`tim.c` 등)도 커밋합니다 — 이번엔 빠져 있어 사후 분석을 `.ioc` 에 기댔습니다
+- 이상한 소리나 열이 나면 바로 전원을 끊습니다 — 이번엔 서보가 울리는데도 끊지 않았습니다
+
+하드웨어 쪽 사후 분석은 [multi-mcu-can/docs/lesson_learned.md](https://github.com/steppenhj/multi-mcu-can/blob/main/docs/lesson_learned.md) 에 있습니다.
+
+---
+
+## 설계 다이어그램 (MBSE)
+
+IBM Rhapsody · StarUML 로 그렸습니다.
+
+<details>
+<summary><b>유스케이스 · 클래스 · 시퀀스 · 상태차트</b></summary>
+
+<br>
+
+**유스케이스** — 조작자의 주행 제어가 코너링 부스트 · 출력 제한 · Return-to-Home 을 포함하고, 하드웨어 환경이 페일세이프에 참여합니다.
+
+![Use Case Diagram](assets/usecase_diagram.png)
+
+**클래스 (C++ 제어 코어)** — `SharedContext` 가 `std::mutex` · `std::atomic` 으로 공유 상태를 지키고, `UdpReceiver` 와 `VehicleController` 가 이를 참조합니다.
+
+![Class Diagram](assets/architecture_diagram.png)
+
+**시퀀스** — 조이스틱 입력이 Web UI → Python → C++ → STM32 로 가며 WebSocket JSON → UDP 바이너리 → UART 문자열로 바뀝니다.
+
+![Sequence Diagram](assets/sequence_diagram.png)
+
+**상태차트 (RTH · Fail-Safe)** — `OPERATING` → `RTH_RECORDING` → `RTH_ACTIVE`, `timeout == true` 이면 `FAIL_SAFE`.
+
+![State Chart Diagram](assets/statechart_diagram.png)
+
+</details>
+
+<details>
+<summary><b>Phase 6 CAN 초기 설계 (3노드)</b> — 구현은 multi-mcu-can 에서 2노드로</summary>
+
+<br>
+
+RPi5(Gateway) · F446RE(MotorECU) · F411RE(SensorECU) 3노드로 설계했습니다. RPi5 쪽은 MCP2515 의 5V 로직을 3.3V GPIO 에 바로 물릴 수 없어 접었고, 구현은 F446RE(bxCAN + SN65HVD230)와 F411RE(MCP2515 + TJA1050) 2노드로 [multi-mcu-can](https://github.com/steppenhj/multi-mcu-can) 에서 했습니다.
+
+![Phase 6 Block Diagram](assets/phase6_block_diagram.png)
+
+설계한 메시지 — `0x100 MotorCMD`(50ms) · `0x200 MotorStatus`(100ms) · `0x300 SensorData`(100ms). SensorECU 가 20cm 미만을 감지하면 MotorECU 가 스스로 멈추는 흐름입니다.
+
+![Phase 6 Sequence Diagram](assets/phase6_sequence_diagram.png)
+
+초기 설계안의 F446RE CAN 배선입니다. 직접 만든 웹 배선도 편집기로 그렸습니다([`tools/CAN_F446RE.json`](tools/CAN_F446RE.json)).
+
+![F446RE CAN Wiring](tools/CAN_F446RE.png)
+
+</details>
+
+---
+
+## 하드웨어 · 기술 스택
+
+| 구성 | 내용 |
+|---|---|
 | MPU | Raspberry Pi 5 (4GB) |
-| MCU — Main | STM32 NUCLEO-F411RE (SensorECU, Phase 1~5) |
-| MCU — Motor | STM32 NUCLEO-F446RE (MotorECU, Phase 6) |
-| CAN 인터페이스 (RPi5) | MCP2515 + TJA1050 (SPI→CAN) |
-| CAN 트랜시버 (F446RE) | MCP2551 (bxCAN) |
-| 장애물 센서 | HC-SR04P 초음파 센서 |
-| 섀시 | 5KG Ackermann 프레임 (인코더 모터 내장) |
-| 모터 드라이버 | Waveshare I2C Motor Driver HAT / L298N |
-| 배터리 | LiPo 7.4V 2S (B2200N-SP35) + UBEC 5A 레귤레이터 |
+| MCU | STM32 NUCLEO-F411RE (Phase 2~5) · NUCLEO-F446RE (Phase 6 이식) |
+| 구동 | Ackermann 섀시 (엔코더 DC 모터 2 · 조향 서보) · L298N · Waveshare I2C Motor Driver HAT |
+| 센서 | 엔코더 · HC-SR04P 초음파 |
+| 전원 | LiPo 7.4V 2S + UBEC 5A |
+| Web | HTML/CSS/JS · nipplejs · Socket.IO |
+| 서버 | Python 3.11 · Flask-SocketIO · eventlet |
+| 제어 코어 | C++17 · UDP · threads · mutex/atomic |
+| 펌웨어 | C (STM32 HAL) · FreeRTOS · 커스텀 부트로더 |
+| 설계 | IBM Rhapsody · StarUML · STM32CubeIDE |
 
-<img src="assets/car_picture.jpg" alt="실제 하드웨어 빌드 — RPi 5 + STM32 Nucleo 제어 스택, 전원 분배, 카메라/모터 배선" width="400">
+전체 부품은 [docs/hardware.md](docs/hardware.md), 펌웨어 빌드는 [firmware/README.md](firmware/README.md) 에 있습니다.
+
+<img src="assets/car_picture.jpg" alt="RPi 5 + STM32 Nucleo 제어 스택과 배선" width="400">
 
 ---
 
-## 시작하기
-
-### 사전 준비
-- Raspberry Pi 5
-- STM32 Nucleo-F411RE + STM32CubeIDE
-- Python 3.11
-
-### 실행
+## 실행
 
 ```bash
-# 1. STM32CubeIDE로 STM32 Firmware 빌드 및 플래시
-#    (Bootloader 먼저, 이후 Application 이미지)
+# 1. 부트로더 — STM32CubeIDE 로 빌드해 ST-Link 로 굽습니다 (Sector 0)
 
-# 2. RPi에서 C++ Control Core 빌드
-cd rpi/
-g++ -o drive_server src/control_core_oop.cpp -pthread
+# 2. 앱 — STM32CubeIDE 로 빌드한 .bin 을 OTA 로 올립니다
+#    앱을 ST-Link 로 직접 구우면 유효 표식이 없어 부트로더가 실행하지 않습니다
+cd web/
+python3 ota_flasher.py <app.bin> /dev/ttyACM0
+#    (웹 UI 에서 .bin 을 올려도 같은 과정을 거칩니다)
 
-# 3. 웹 서버 시작
-cd rpi/web/
+# 3. RPi 에서 C++ 제어 코어 빌드·실행 (저장소 루트)
+g++ -std=c++17 -O2 -pthread -o drive_server src/control_core_oop.cpp
+./drive_server
+
+# 4. 다른 터미널에서 웹 서버
+cd web/
 python3 app.py
-
-# 4. 브라우저에서 접속 → http://<rpi-ip>:5000
+# 브라우저 → http://<rpi-ip>:5000
 ```
-
-### OTA Firmware 업데이트 (Phase 5)
-
-```bash
-# 프로그래머 없이 UART로 새 Application 이미지 플래시
-cd rpi/web/
-python3 ota_flasher.py parkhaejin_car.bin
-```
-
----
-
-## 후속 프로젝트
-
-**[multi-mcu-can](https://github.com/steppenhj/multi-mcu-can)** — Phase 6은 CAN 2.0 Multi-MCU 분산 통신에 특화된 별도 저장소로 분리되었습니다. 액추에이터 레이어를 제거하고 핵심에 집중합니다: bxCAN 주변장치 설정, MCP2515 SPI-to-CAN 브리징, 다중 노드 간 메시지 중재.
 
 ---
 
 ## 작성자
 
-**박해진 (Haejin Park)**  
+**박해진 (Haejin Park)**
