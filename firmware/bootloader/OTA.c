@@ -50,20 +50,14 @@ typedef struct {
 // 별도 부팅 핀 없이 UART만으로 모드를 가르는 대가. 
 
 #define ACK_TIMEOUT_MS 5000  // 청크 수신 타임아웃 (5초)
-<<<<<<< firmware/bootloader/OTA.c
-#define MAX_APP_SIZE ((512-16) * 1024)  //최대 App 크기 (496KB)
-// 512KB=전체 Flash, 16KB=Sector 0(부트로더). 즉 앱이 쓸 수 있는 Sector 1~7의 합
-
-=======
-
 // [추가] 유효 표식 위치: Sector 7 마지막 16바이트 (0x0807FFF0)
 // Sector 7은 업데이트 시작 때 앱 영역과 함께 지워지므로, 새 이미지가 CRC를 통과해야만 다시 기록됨
 #define META_ADDRESS 0x0807FFF0
 #define META_MAGIC   0x5A5AA5A5U
 
 // [변경] 마지막 청크의 0xFF 패딩이 표식 영역을 덮지 않도록 한 청크만큼 여유를 둠
+// 512KB=전체 Flash, 16KB=Sector 0(부트로더). 앱 자리 Sector 1~7 에서 한 청크를 뺀 값
 #define MAX_APP_SIZE (((512-16) * 1024) - CHUNK_SIZE)
->>>>>>> phase_history/phase_5_code/new_Ota.c
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -137,19 +131,12 @@ int main(void)
   HAL_GPIO_WritePin(LD2_GPIO_Port, LD2_Pin, GPIO_PIN_SET);
 
   // Step1: 업데이트 신호 대기 (3초)
-<<<<<<< firmware/bootloader/OTA.c
-  if(!WaitForUpdateSignal(UPDATE_TIMEOUT_MS)){ // 이 분기가 부트로더의 유일한 갈림길. 
-	  //신호 없음 -> 정상 부팅, 신호 있음 -> 업데이트 모드
-	  HAL_GPIO_WritePin(LD2_GPIO_Port, LD2_Pin, GPIO_PIN_RESET);
-	  JumpToApp();
-=======
-  if(!WaitForUpdateSignal(UPDATE_TIMEOUT_MS)){
-	  // [변경] 신호 없음 -> 검증된 앱일 때만 점프
+  if(!WaitForUpdateSignal(UPDATE_TIMEOUT_MS)){ // 이 분기가 부트로더의 유일한 갈림길.
+	  // [변경] 신호 없음 -> 검증된 앱일 때만 점프, 신호 있음 -> 업데이트 모드
 	  if(IsAppValid()){
 		  HAL_GPIO_WritePin(LD2_GPIO_Port, LD2_Pin, GPIO_PIN_RESET);
 		  JumpToApp();
 	  }
->>>>>>> phase_history/phase_5_code/new_Ota.c
 
 	  // [변경] 유효한 앱 없음(전송 중단·CRC 불일치·빈 영역) -> 실행하지 않고 업데이트 대기
 	  // 기존: LED 점멸 무한 루프(리셋 전까지 업데이트 불가)
