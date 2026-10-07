@@ -19,7 +19,8 @@
  *      7/21 추가
  *      안전 정책(fail-stop): 통신 두절(watchdog timeout) 시 무조건 정지. 
  *                  RTH는 조작자가 트리거하는 '감독 하 자율(supervised autonomy)' - 
- *                  복귀 중에도 링크가 살아있어야 하며(dead-man switch), 두절 시 즉시 FAIL_SAFE 정지
+ *                  복귀 중에는 RPi 안 서버가 keep-alive 를 보내는 동안만 진행하며, 
+ *                  서버 프로세스가 죽으면 즉시 FAIL_SAFE 정지 (브라우저·Wi-Fi 단절은 이 층에서 못 잡는다)
  *
  *  compile 명령어: g++ -std=c++17 -O2 -Wall -Wextra -pthread -o /dev/null src/control_core_oop.cpp
  */
@@ -562,7 +563,7 @@ private:
                 }    
 
                 // 5b. RTH 복귀 모드
-                // !timeout = dead-man switch: 자율 복귀도 링크(조작자 감독)가 살아있을 때만 진행
+                // !timeout = 서버 keep-alive 가 살아 있을 때만 복귀 진행 (서버 프로세스 생존 감시 · 브라우저 단절은 못 잡음)
                 // 링크 상실 시에는 위 3번 분기가 매 틱 정지 명령을 보낸다 (fail-stop)
                 if(rth_mode == 2 && !timeout) {
                     auto motor = rth.executeStep(enc_val);
