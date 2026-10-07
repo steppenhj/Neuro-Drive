@@ -29,6 +29,15 @@
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
 
+// [추가] 앱 유효 표식 (Flash 맨 끝 16바이트)
+// magic은 맨 마지막에 기록 -> 기록 도중 전원이 끊겨도 표식은 무효로 남음
+typedef struct {
+	uint32_t magic;      // META_MAGIC
+	uint32_t size;       // 검증된 이미지 크기
+	uint32_t crc;        // 검증된 CRC32
+	uint32_t magic_inv;  // ~META_MAGIC (이중 확인)
+} AppMeta;
+
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
@@ -41,9 +50,20 @@
 // 별도 부팅 핀 없이 UART만으로 모드를 가르는 대가. 
 
 #define ACK_TIMEOUT_MS 5000  // 청크 수신 타임아웃 (5초)
+<<<<<<< firmware/bootloader/OTA.c
 #define MAX_APP_SIZE ((512-16) * 1024)  //최대 App 크기 (496KB)
 // 512KB=전체 Flash, 16KB=Sector 0(부트로더). 즉 앱이 쓸 수 있는 Sector 1~7의 합
 
+=======
+
+// [추가] 유효 표식 위치: Sector 7 마지막 16바이트 (0x0807FFF0)
+// Sector 7은 업데이트 시작 때 앱 영역과 함께 지워지므로, 새 이미지가 CRC를 통과해야만 다시 기록됨
+#define META_ADDRESS 0x0807FFF0
+#define META_MAGIC   0x5A5AA5A5U
+
+// [변경] 마지막 청크의 0xFF 패딩이 표식 영역을 덮지 않도록 한 청크만큼 여유를 둠
+#define MAX_APP_SIZE (((512-16) * 1024) - CHUNK_SIZE)
+>>>>>>> phase_history/phase_5_code/new_Ota.c
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -71,6 +91,8 @@ int WaitForUpdateSignal(uint32_t timeout_ms);
 HAL_StatusTypeDef EraseAppFlash(void);
 HAL_StatusTypeDef WriteChunkToFlash(uint32_t address, uint8_t* data, uint32_t len);
 uint32_t CalculateFlashCRC(uint32_t start_addr, uint32_t size);
+int IsAppValid(void);                                        // [추가]
+HAL_StatusTypeDef WriteAppMeta(uint32_t size, uint32_t crc); // [추가]
 
 /* USER CODE END PFP */
 
@@ -115,16 +137,25 @@ int main(void)
   HAL_GPIO_WritePin(LD2_GPIO_Port, LD2_Pin, GPIO_PIN_SET);
 
   // Step1: 업데이트 신호 대기 (3초)
+<<<<<<< firmware/bootloader/OTA.c
   if(!WaitForUpdateSignal(UPDATE_TIMEOUT_MS)){ // 이 분기가 부트로더의 유일한 갈림길. 
 	  //신호 없음 -> 정상 부팅, 신호 있음 -> 업데이트 모드
 	  HAL_GPIO_WritePin(LD2_GPIO_Port, LD2_Pin, GPIO_PIN_RESET);
 	  JumpToApp();
+=======
+  if(!WaitForUpdateSignal(UPDATE_TIMEOUT_MS)){
+	  // [변경] 신호 없음 -> 검증된 앱일 때만 점프
+	  if(IsAppValid()){
+		  HAL_GPIO_WritePin(LD2_GPIO_Port, LD2_Pin, GPIO_PIN_RESET);
+		  JumpToApp();
+	  }
+>>>>>>> phase_history/phase_5_code/new_Ota.c
 
-	  //JumpToApp실패 (App이 없음-그럴 일은 거의 없겠지만) -> LED 빠른 점멸로 표시
+	  // [변경] 유효한 앱 없음(전송 중단·CRC 불일치·빈 영역) -> 실행하지 않고 업데이트 대기
+	  // 기존: LED 점멸 무한 루프(리셋 전까지 업데이트 불가)
 	  SendString("NO_APP\r\n");
-	  while(1){
-		  HAL_GPIO_TogglePin(LD2_GPIO_Port, LD2_Pin);
-		  HAL_Delay(200);
+	  while(!WaitForUpdateSignal(1000)){
+		  HAL_GPIO_TogglePin(LD2_GPIO_Port, LD2_Pin); // 1초 주기 점멸
 	  }
   }
 
@@ -144,7 +175,7 @@ int main(void)
   }
   SendString("ACK\r\n");
 
-  //Step4: Flash Erase
+  //Step4: Flash Erase (Sector 1~7, 유효 표식도 함께 지워짐)
   HAL_FLASH_Unlock();
 
   if(EraseAppFlash() != HAL_OK){
@@ -167,7 +198,7 @@ int main(void)
 	  if(HAL_UART_Receive(&huart2, chunk, CHUNK_SIZE, ACK_TIMEOUT_MS) != HAL_OK){
 		  HAL_FLASH_Lock();
 		  SendString("ERR_RX\r\n");
-		  NVIC_SystemReset();
+		  NVIC_SystemReset(); // 표식이 없으므로 재부팅 후 점프하지 않음
 	  }
 
 	  //Flash에 기록
@@ -188,7 +219,7 @@ int main(void)
 
   HAL_FLASH_Lock();
 
-  //Step6: CRC검증
+  //Step6: CRC검증 (Flash에서 다시 읽어 계산)
   uint32_t expected_crc = 0;
   if(HAL_UART_Receive(&huart2, (uint8_t*)&expected_crc, 4, ACK_TIMEOUT_MS) != HAL_OK) {
 	  SendString("ERR_CRC_RX\r\n");
@@ -200,14 +231,23 @@ int main(void)
 
   if(actual_crc != expected_crc){
 	  SendString("NACK\r\n");
-	  NVIC_SystemReset(); //CRC불일치 -> 재부팅 -> 부트로더 재진입
+	  NVIC_SystemReset(); //CRC불일치 -> 표식 없이 재부팅 -> 업데이트 대기
   }
 
-  //Step7 : 성공 -> 재부팅
+  // [추가] Step7: CRC 통과 -> 유효 표식 기록
+  HAL_FLASH_Unlock();
+  if(WriteAppMeta(total_size, actual_crc) != HAL_OK){
+	  HAL_FLASH_Lock();
+	  SendString("ERR_META\r\n");
+	  NVIC_SystemReset();
+  }
+  HAL_FLASH_Lock();
+
+  //Step8 : 성공 -> 재부팅
   SendString("DONE\r\n");
   HAL_Delay(100);
   NVIC_SystemReset();
-  //재부팅 후 -> 부트로더 -> 3초대기 -> 신호 없음 -> JumpToApp -> 새 펌웨어
+  //재부팅 후 -> 부트로더 -> 3초대기 -> 신호 없음 -> 표식·CRC 확인 -> JumpToApp -> 새 펌웨어
 
   /* USER CODE END 2 */
 
@@ -451,6 +491,31 @@ uint32_t CalculateFlashCRC(uint32_t start_addr, uint32_t size)
 		}
 	}
 	return crc ^ 0xFFFFFFFF;
+}
+
+// 7. [추가] 부팅 시 앱 유효성 확인: 표식이 있고, 기록된 CRC와 현재 Flash 내용이 일치해야 통과
+int IsAppValid(void)
+{
+	const volatile AppMeta* meta = (const volatile AppMeta*)META_ADDRESS;
+
+	if(meta->magic != META_MAGIC || meta->magic_inv != ~META_MAGIC) {
+		return 0; // 표식 없음: 전송 중단 또는 CRC 불일치로 끝난 업데이트
+	}
+	if(meta->size == 0 || meta->size > MAX_APP_SIZE) {
+		return 0;
+	}
+	return (CalculateFlashCRC(APP_ADDRESS, meta->size) == meta->crc);
+}
+
+// 8. [추가] 유효 표식 기록 (CRC 통과 후에만 호출)
+// magic을 가장 마지막에 기록: 도중에 전원이 끊기면 magic이 0xFFFFFFFF로 남아 무효 처리됨
+HAL_StatusTypeDef WriteAppMeta(uint32_t size, uint32_t crc)
+{
+	if(HAL_FLASH_Program(FLASH_TYPEPROGRAM_WORD, META_ADDRESS + 4,  size) != HAL_OK) return HAL_ERROR;
+	if(HAL_FLASH_Program(FLASH_TYPEPROGRAM_WORD, META_ADDRESS + 8,  crc) != HAL_OK) return HAL_ERROR;
+	if(HAL_FLASH_Program(FLASH_TYPEPROGRAM_WORD, META_ADDRESS + 12, ~META_MAGIC) != HAL_OK) return HAL_ERROR;
+	if(HAL_FLASH_Program(FLASH_TYPEPROGRAM_WORD, META_ADDRESS + 0,  META_MAGIC) != HAL_OK) return HAL_ERROR;
+	return HAL_OK;
 }
 
 /* USER CODE END 4 */
